@@ -46,16 +46,21 @@ class Telegram:
 
 
 def get_exchange() -> "ccxt.okx":
-    api_key = os.getenv("OKX_API_KEY")
-    api_secret = os.getenv("OKX_API_SECRET")
-    password = os.getenv("OKX_API_PASSPHRASE")
-    return ccxt.okx({
-        "apiKey": api_key,
-        "secret": api_secret,
-        "password": password,
-        "enableRateLimit": True,
-        "options": {"defaultType": "swap"},
-    })
+    api_key = os.getenv("OKX_API_KEY") or os.getenv("OKX_KEY")
+    api_secret = os.getenv("OKX_API_SECRET") or os.getenv("OKX_SECRET")
+    password = os.getenv("OKX_API_PASSPHRASE") or os.getenv("OKX_PASSWORD")
+    exchange = ccxt.okx(
+        {
+            "apiKey": api_key,
+            "secret": api_secret,
+            "password": password,
+            "enableRateLimit": True,
+            "options": {"defaultType": "swap"},
+        }
+    )
+    if os.getenv("OKX_DEMO") == "1":
+        exchange.set_sandbox_mode(True)
+    return exchange
 
 
 def top_symbols(ex: "ccxt.okx", limit: int = 20) -> List[str]:
@@ -90,8 +95,10 @@ class Bot3:
     def __init__(self) -> None:
         self.ex = get_exchange()
         self.telegram = Telegram()
-        self.max_positions = 2
-        self.usdt_per_trade = 100
+        self.max_positions = int(os.getenv("MAX_CONCURRENT", "2"))
+        self.usdt_per_trade = float(os.getenv("POSITION_NOTIONAL_USD", "100"))
+        self.margin_mode = os.getenv("MARGIN_MODE", "cross")
+        self.leverage = float(os.getenv("LEVERAGE", "10"))
         self.positions: Dict[str, Position] = {}
 
     def train_model(self, df: pd.DataFrame) -> LogisticRegression:
@@ -131,18 +138,24 @@ class Bot3:
 
     def open_trade(self, p: Position) -> None:
         try:
-            self.ex.private_post_trade_order({
-                "instId": p.symbol.replace("/USDT:USDT", "-SWAP"),
-                "tdMode": "cross",
-                "side": "buy" if p.side == "long" else "sell",
-                "ordType": "market",
-                "sz": p.size,
-                "lever": 10,
-                "sl": p.stop_loss,
-                "tp": p.take_profit,
-            })
-        except Exception:
-            pass
+            inst_id = p.symbol.replace("/USDT:USDT", "-SWAP")
+            resp = self.ex.private_post_trade_order(
+                {
+                    "instId": inst_id,
+                    "tdMode": self.margin_mode,
+                    "side": "buy" if p.side == "long" else "sell",
+                    "ordType": "market",
+                    "sz": p.size,
+                    "lever": self.leverage,
+                    "sl": p.stop_loss,
+                    "tp": p.take_profit,
+                }
+            )
+            if resp.get("code") != "0":
+                raise Exception(resp.get("msg"))
+        except Exception as e:
+            self.telegram.send(f"Order failed for {p.symbol}: {e}")
+            return
         self.positions[p.symbol] = p
         self.telegram.send(f"Opened {p.side} {p.symbol} @ {p.entry:.4f}")
 
